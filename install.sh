@@ -68,9 +68,58 @@ make_pki(){
   openssl req -new -newkey rsa:2048 -nodes -keyout "$tmp/edge.key" -out "$tmp/edge.csr" -subj "/CN=$profile-edge" >/dev/null 2>&1
   printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature,keyEncipherment\nextendedKeyUsage=clientAuth\n' >"$tmp/edge.ext"
   openssl x509 -req -in "$tmp/edge.csr" -CA "$PKI_DIR/ca.crt" -CAkey "$PKI_DIR/ca.key" -CAcreateserial -out "$tmp/edge.crt" -days 825 -sha256 -extfile "$tmp/edge.ext" >/dev/null 2>&1
-  cp "$PKI_DIR/ca.crt" "$tmp/ca.crt"; tar -czf "$bundle" -C "$tmp" edge.crt edge.key ca.crt; rm -rf "$tmp"
+  cp "$PKI_DIR/ca.crt" "$tmp/ca.crt"
+  [[ ! -f "$PKI_DIR/$profile.forwards" ]] || cp "$PKI_DIR/$profile.forwards" "$tmp/forwards.map"
+  tar -czf "$bundle" -C "$tmp" edge.crt edge.key ca.crt $([[ -f "$tmp/forwards.map" ]] && printf '%s' forwards.map)
+  rm -rf "$tmp"
   chmod 0640 "$PKI_DIR/ca.crt" "$PKI_DIR/hub.crt"; chmod 0600 "$PKI_DIR/ca.key" "$PKI_DIR/hub.key"; chgrp zoodtunnel "$PKI_DIR/ca.crt" "$PKI_DIR/hub.crt" "$PKI_DIR/hub.key"
   echo "Edge PKI bundle: $bundle"
+}
+
+collect_forwards(){
+  local profile=$1 map="$PKI_DIR/$profile.forwards" add name protocol public_port target_ip target_port
+  : >"$map"; chmod 0640 "$map"; chgrp zoodtunnel "$map"
+  while true; do
+    add="$(ask 'Add a port forward? (yes/no)' no)"; [[ $add == yes || $add == y ]] || break
+    name="$(ask 'Mapping name' service)"; protocol="$(ask 'Protocol (tcp/udp/both)' both)"
+    public_port="$(ask 'Public/listener port' 443)"; target_ip="$(ask 'Target IP on this Hub' 127.0.0.1)"; target_port="$(ask 'Target service port' "$public_port")"
+    [[ $name =~ ^[A-Za-z0-9_-]+$ ]] || die "Invalid mapping name"
+    [[ $protocol == tcp || $protocol == udp || $protocol == both ]] || die "Invalid protocol"
+    [[ $public_port =~ ^[0-9]+$ && $public_port -ge 1 && $public_port -le 65535 ]] || die "Invalid public port"
+    [[ $target_port =~ ^[0-9]+$ && $target_port -ge 1 && $target_port -le 65535 ]] || die "Invalid target port"
+    if [[ $protocol == tcp || $protocol == both ]]; then printf '%s|tcp|%s|%s|%s\n' "${name}-tcp" "$public_port" "$target_ip" "$target_port" >>"$map"; fi
+    if [[ $protocol == udp || $protocol == both ]]; then printf '%s|udp|%s|%s|%s\n' "${name}-udp" "$public_port" "$target_ip" "$target_port" >>"$map"; fi
+  done
+}
+
+append_hub_forwards(){
+  local profile=$1 config=$2 name protocol public_port target_ip target_port
+  [[ -s "$PKI_DIR/$profile.forwards" ]] || return 0
+  while IFS='|' read -r name protocol public_port target_ip target_port; do
+    tee -a "$config" >/dev/null <<EOF
+
+[[forwards]]
+name = "$name"
+protocol = "$protocol"
+bind = "127.0.0.1:0"
+target = "$target_ip:$target_port"
+EOF
+  done <"$PKI_DIR/$profile.forwards"
+}
+
+append_edge_forwards(){
+  local config=$1 map=$2 name protocol public_port target_ip target_port
+  [[ -s $map ]] || return 0
+  while IFS='|' read -r name protocol public_port target_ip target_port; do
+    tee -a "$config" >/dev/null <<EOF
+
+[[forwards]]
+name = "$name"
+protocol = "$protocol"
+bind = "0.0.0.0:$public_port"
+target = "$target_ip:$target_port"
+EOF
+  done <"$map"
 }
 
 create_hub(){
@@ -78,7 +127,7 @@ create_hub(){
   local profile port transport server_name address
   profile="$(ask 'Profile name' game)"; port="$(ask 'Carrier port' 4433)"; transport="$(ask 'Transport (quic/tcp_tls)' quic)"; server_name="$(ask 'Hub TLS name' hub.local)"; address="$(ask 'Hub TUN address' 10.77.0.1/30)"
   [[ $profile =~ ^[A-Za-z0-9_-]+$ ]] || die "Invalid profile"; [[ $transport == quic || $transport == tcp_tls ]] || die "Invalid transport"
-  make_pki "$server_name" "$profile"; install -m 0640 -o root -g zoodtunnel /dev/null "$PROFILE_DIR/$profile.toml"
+  collect_forwards "$profile"; make_pki "$server_name" "$profile"; install -m 0640 -o root -g zoodtunnel /dev/null "$PROFILE_DIR/$profile.toml"
   tee "$PROFILE_DIR/$profile.toml" >/dev/null <<EOF
 profile = "$profile"
 mode = "hub"
@@ -99,8 +148,9 @@ name = "ztun0"
 address = "$address"
 mtu = 1280
 EOF
+  append_hub_forwards "$profile" "$PROFILE_DIR/$profile.toml"
   zoodtunneld --config "$PROFILE_DIR/$profile.toml" --check; systemctl enable --now "zoodtunnel@$profile"
-  echo "Hub $profile active. Copy /root/zoodtunnel-$profile-edge-pki.tar.gz securely to the foreign server."
+  echo "Target/Hub $profile active. Copy /root/zoodtunnel-$profile-edge-pki.tar.gz securely to the Listener/Edge server."
 }
 
 create_edge(){
@@ -136,6 +186,7 @@ address = "$address"
 mtu = 1280
 protect_peer_route = true
 EOF
+  append_edge_forwards "$PROFILE_DIR/$profile.toml" "$PKI_DIR/forwards.map"
   zoodtunneld --config "$PROFILE_DIR/$profile.toml" --check; systemctl enable --now "zoodtunnel@$profile"; echo "Edge $profile active."
 }
 
@@ -147,7 +198,7 @@ rollback(){
 }
 
 menu(){
-  echo "ZoodTunnel installer / manager"; echo "1) Install or update from GitHub"; echo "2) Create Iran/Hub profile"; echo "3) Create Foreign/Edge profile"; echo "4) Show status"; echo "5) Roll back binary"; echo "0) Exit"
+  echo "ZoodTunnel installer / manager"; echo "1) Install or update from GitHub"; echo "2) Create Target/Hub profile (service side)"; echo "3) Create Listener/Edge profile (public-port side)"; echo "4) Show status"; echo "5) Roll back binary"; echo "0) Exit"
   read -r -p "Select: " choice
   case "$choice" in 1) install_github;; 2) create_hub;; 3) create_edge;; 4) systemctl --no-pager --full status 'zoodtunnel@*' || true;; 5) rollback;; 0) exit 0;; *) die "Invalid selection";; esac
 }
