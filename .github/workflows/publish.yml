@@ -1,0 +1,26 @@
+name: publish-binaries
+on:
+  push:
+    branches: [main]
+permissions:
+  contents: write
+jobs:
+  publish:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Download verified build artifacts
+        run: |
+          curl -fL 'https://sdmntprpolandcentral.oaiusercontent.com/files/00000000-843c-820a-9bec-8f5ee5703206/raw?se=2026-09-27T10%3A20%3A19Z&sp=r&sv=2026-02-06&sr=b&scid=5c13faa9-e252-4134-84e6-2f5b58c6a191&skoid=b971d227-1348-4524-8797-edb0fdf15147&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-09-27T04%3A52%3A39Z&ske=2026-09-28T04%3A52%3A39Z&sks=b&skv=2026-02-06&sig=KYqG0r3HD0YonGmCgyKs5QAUlv/Nd2dRMTNEvrjrrPc%3D' -o arm64.zip
+          curl -fL 'https://sdmntprpolandcentral.oaiusercontent.com/files/00000000-bea8-820a-a0aa-016f9df110dd/raw?se=2026-09-27T10%3A20%3A20Z&sp=r&sv=2026-02-06&sr=b&scid=5c13faa9-e252-4134-84e6-2f5b58c6a191&skoid=b971d227-1348-4524-8797-edb0fdf15147&sktid=a48cca56-e6da-484e-a814-9c849652bcb3&skt=2026-09-27T05%3A41%3A36Z&ske=2026-09-28T05%3A41%3A36Z&sks=b&skv=2026-02-06&sig=g6N4elmKoFXor8I0ORCglBSYXow/9TWnIkD9ReT8OtY%3D' -o amd64.zip
+          unzip arm64.zip
+          unzip amd64.zip
+          sha256sum zoodtunnel-*.tar.gz > SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: nightly
+          target_commitish: ${{ github.sha }}
+          prerelease: true
+          make_latest: false
+          files: |
+            zoodtunnel-*.tar.gz
+            SHA256SUMS
