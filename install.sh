@@ -53,7 +53,8 @@ install_github(){
   grep "zoodtunnel-$target.tar.gz" "$sums" | sed "s#zoodtunnel-$target.tar.gz#$(basename "$archive")#" | (cd "$(dirname "$archive")" && sha256sum -c -)
   layout; release_dir="$INSTALL_ROOT/releases/$(date +%Y%m%d%H%M%S)-$target"; install -d -m 0755 "$release_dir"
   tar -xzf "$archive" -C "$release_dir"; rm -f "$archive" "$sums"; activate "$release_dir"
-  systemctl list-unit-files 'zoodtunnel@*.service' --no-legend 2>/dev/null | awk '{print $1}' | xargs -r systemctl restart
+  systemctl list-unit-files 'zoodtunnel@*.service' --no-legend 2>/dev/null |
+    awk '$1 ~ /^zoodtunnel@.+\.service$/ {print $1}' | xargs -r systemctl restart
   echo "GitHub release installed from $REPO."
 }
 
@@ -194,7 +195,9 @@ rollback(){
   [[ -L $PREVIOUS ]] || die "No previous release"
   local old current; old="$(readlink -f "$PREVIOUS")"; current="$(readlink -f "$CURRENT")"; ln -sfn "$current" "$PREVIOUS"; ln -sfn "$old" "$CURRENT"
   ln -sfn "$CURRENT/zoodtunneld" /usr/local/bin/zoodtunneld; ln -sfn "$CURRENT/zoodtunnelctl" /usr/local/bin/zoodtunnelctl
-  systemctl list-unit-files 'zoodtunnel@*.service' --no-legend 2>/dev/null | awk '{print $1}' | xargs -r systemctl restart; echo "Rolled back to $old"
+  systemctl list-unit-files 'zoodtunnel@*.service' --no-legend 2>/dev/null |
+    awk '$1 ~ /^zoodtunnel@.+\.service$/ {print $1}' | xargs -r systemctl restart
+  echo "Rolled back to $old"
 }
 
 menu(){
