@@ -44,17 +44,12 @@ install_local(){
 
 install_github(){
   need curl; need tar; need sha256sum
-  local target archive sums release_dir version token
-  target="$(arch)"; version="${ZOODTUNNEL_VERSION:-nightly}"; token="${GITHUB_TOKEN:-${GH_TOKEN:-}}"
+  local target archive sums release_dir version
+  target="$(arch)"; version="${ZOODTUNNEL_VERSION:-nightly}"
   archive="$(mktemp)"; sums="$(mktemp)"
   local base="https://github.com/$REPO/releases"; [[ $version == latest ]] && base+="/latest/download" || base+="/download/$version"
-  if [[ -n $token ]]; then
-    curl -fL --retry 3 -H "Authorization: Bearer $token" "$base/zoodtunnel-$target.tar.gz" -o "$archive"
-    curl -fL --retry 3 -H "Authorization: Bearer $token" "$base/SHA256SUMS" -o "$sums"
-  else
-    curl -fL --retry 3 "$base/zoodtunnel-$target.tar.gz" -o "$archive"
-    curl -fL --retry 3 "$base/SHA256SUMS" -o "$sums"
-  fi
+  curl -fL --retry 3 "$base/zoodtunnel-$target.tar.gz" -o "$archive"
+  curl -fL --retry 3 "$base/SHA256SUMS" -o "$sums"
   grep "zoodtunnel-$target.tar.gz" "$sums" | sed "s#zoodtunnel-$target.tar.gz#$(basename "$archive")#" | (cd "$(dirname "$archive")" && sha256sum -c -)
   layout; release_dir="$INSTALL_ROOT/releases/$(date +%Y%m%d%H%M%S)-$target"; install -d -m 0755 "$release_dir"
   tar -xzf "$archive" -C "$release_dir"; rm -f "$archive" "$sums"; activate "$release_dir"
