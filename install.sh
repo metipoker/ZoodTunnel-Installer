@@ -14,6 +14,63 @@ need(){ command -v "$1" >/dev/null 2>&1 || die "Missing command: $1"; }
 ask(){ local prompt=$1 default=${2:-}; read -r -p "$prompt [$default]: " REPLY; printf '%s' "${REPLY:-$default}"; }
 arch(){ case "$(uname -m)" in x86_64|amd64) echo x86_64-unknown-linux-gnu;; aarch64|arm64) echo aarch64-unknown-linux-gnu;; *) die "Unsupported architecture: $(uname -m)";; esac; }
 
+prepare_server(){
+  [[ $(uname -s) == Linux ]] || die 'ZoodTunnel requires Linux'
+  local target family="" os manager certs pkg i
+  local -a commands packages missing=()
+  target=$(arch)
+  [[ -r /etc/os-release ]] || die 'Missing /etc/os-release'
+  . /etc/os-release
+  for os in ${ID:-} ${ID_LIKE:-}; do
+    case "$os" in
+      debian|ubuntu) family=deb; break ;;
+      rhel|fedora|centos|rocky|almalinux|amzn) family=rpm; break ;;
+    esac
+  done
+  [[ -n $family ]] || die "Unsupported distribution: ${PRETTY_NAME:-unknown}"
+  [[ -d /run/systemd/system ]] || die 'Boot the server with systemd before installing'
+  printf 'Preparing %s (%s)\n' "${PRETTY_NAME:-$ID}" "$target"
+  commands=(curl tar gzip openssl python3 ip groupadd useradd sha256sum awk systemctl journalctl xargs cmp)
+  if [[ $family == deb ]]; then
+    packages=(curl tar gzip openssl python3 iproute2 passwd passwd coreutils mawk systemd systemd findutils diffutils)
+    certs=/etc/ssl/certs/ca-certificates.crt
+    manager=apt-get
+  else
+    packages=(curl tar gzip openssl python3 iproute shadow-utils shadow-utils coreutils gawk systemd systemd findutils diffutils)
+    certs=/etc/pki/tls/certs/ca-bundle.crt
+    if command -v dnf >/dev/null; then manager=dnf; else manager=yum; fi
+  fi
+  for i in "${!commands[@]}"; do
+    if ! command -v "${commands[i]}" >/dev/null; then
+      pkg=${packages[i]}
+      [[ " ${missing[*]} " == *" $pkg "* ]] || missing+=("$pkg")
+    fi
+  done
+  [[ -s $certs ]] || missing+=(ca-certificates)
+  if (( ${#missing[@]} )); then
+    need "$manager"
+    if [[ $manager == apt-get ]]; then
+      apt-get update
+      DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "${missing[@]}"
+    else
+      "$manager" install -y "${missing[@]}"
+    fi
+  fi
+  for i in "${commands[@]}"; do need "$i"; done
+  [[ -s $certs ]] || die 'System CA bundle unavailable'
+}
+
+bootstrap_menu(){
+  prepare_server
+  if ! zoodtunneld --help >/dev/null 2>&1 || ! zoodtunnelctl --help >/dev/null 2>&1 ||
+     ! systemctl cat zoodtunnel@.service >/dev/null 2>&1; then
+    install_github
+  fi
+  zoodtunneld --help >/dev/null && zoodtunnelctl --help >/dev/null || die 'Core verification failed'
+  systemctl cat zoodtunnel@.service >/dev/null || die 'Missing systemd service template'
+  menu
+}
+
 layout(){
   getent group zoodtunnel >/dev/null || groupadd --system zoodtunnel
   id zoodtunnel >/dev/null 2>&1 || useradd --system --gid zoodtunnel --home-dir /var/lib/zoodtunnel --shell /usr/sbin/nologin zoodtunnel
@@ -47,27 +104,28 @@ install_local(){
   activate "$release_dir"; echo "Local build installed."
 }
 
-install_github(){
+install_github()(
   need curl; need tar; need sha256sum
   local target archive sums release_dir version
   target="$(arch)"; version="${ZOODTUNNEL_VERSION:-nightly}"
-  archive="$(mktemp)"; sums="$(mktemp)"
+  local tmp
+  tmp=$(mktemp -d); trap 'rm -rf -- "$tmp"' EXIT
+  archive="$tmp/release.tar.gz"; sums="$tmp/SHA256SUMS"
   local base="https://github.com/$REPO/releases"; [[ $version == latest ]] && base+="/latest/download" || base+="/download/$version"
-  local -a headers=()
-  [[ -z ${token:-} ]] || headers=(-H "Authorization: Bearer $token")
-  curl -fsSL --retry 3 "${headers[@]}" "$base/SHA256SUMS" -o "$sums"
+  curl -fsSL --retry 3 "$base/SHA256SUMS" -o "$sums"
   local portable="${target%-gnu}-musl" digest
   if awk -v f="zoodtunnel-$portable.tar.gz" '$2==f {found=1} END {exit !found}' "$sums"; then target="$portable"; fi
   digest="$(awk -v f="zoodtunnel-$target.tar.gz" '$2==f {print $1}' "$sums")"
   [[ $digest =~ ^[[:xdigit:]]{64}$ ]] || die "Release checksum unavailable for $target"
-  curl -fsSL --retry 3 "${headers[@]}" "$base/zoodtunnel-$target.tar.gz" -o "$archive"
+  curl -fsSL --retry 3 "$base/zoodtunnel-$target.tar.gz" -o "$archive"
   printf '%s  %s\n' "$digest" "$archive" | sha256sum -c -
-  layout; release_dir="$INSTALL_ROOT/releases/$(date +%Y%m%d%H%M%S)-$target"; install -d -m 0755 "$release_dir"
-  tar -xzf "$archive" -C "$release_dir"; rm -f "$archive" "$sums"; activate "$release_dir"
-  systemctl list-unit-files 'zoodtunnel@*.service' --no-legend 2>/dev/null |
+  layout; release_dir=$(mktemp -d "$INSTALL_ROOT/releases/$target.XXXXXXXX"); chmod 0755 "$release_dir"
+  tar -xzf "$archive" -C "$release_dir"; [[ -f $release_dir/zoodtunnel@.service ]] || die "Release missing service template"
+  activate "$release_dir"
+  systemctl list-units --state=active --plain 'zoodtunnel@*.service' --no-legend 2>/dev/null |
     awk '$1 ~ /^zoodtunnel@.+\.service$/ {print $1}' | xargs -r systemctl restart
   echo "GitHub release installed from $REPO."
-}
+)
 
 make_pki(){
   need openssl
@@ -206,7 +264,7 @@ rollback(){
   [[ -L $PREVIOUS ]] || die "No previous release"
   local old current; old="$(readlink -f "$PREVIOUS")"; current="$(readlink -f "$CURRENT")"; ln -sfn "$current" "$PREVIOUS"; ln -sfn "$old" "$CURRENT"
   ln -sfn "$CURRENT/zoodtunneld" /usr/local/bin/zoodtunneld; ln -sfn "$CURRENT/zoodtunnelctl" /usr/local/bin/zoodtunnelctl
-  systemctl list-unit-files 'zoodtunnel@*.service' --no-legend 2>/dev/null |
+  systemctl list-units --state=active --plain 'zoodtunnel@*.service' --no-legend 2>/dev/null |
     awk '$1 ~ /^zoodtunnel@.+\.service$/ {print $1}' | xargs -r systemctl restart
   echo "Rolled back to $old"
 }
@@ -340,7 +398,7 @@ profile_actions(){
 }
 
 manage_profiles(){
-  local cfg name choice
+  local cfg name choice state
   local -a profiles
   while true; do
     profiles=()
@@ -350,7 +408,8 @@ manage_profiles(){
       name=${cfg##*/}; name=${name%.toml}
       [[ $name =~ ^[A-Za-z0-9_-]{1,64}$ ]] || continue
       profiles+=("$cfg")
-      printf '%d  %s\n' "${#profiles[@]}" "$name"
+      state=$(systemctl is-active "zoodtunnel@$name.service") || state=${state:-unknown}
+      printf '%d  %s  [%s]\n' "${#profiles[@]}" "$name" "$state"
     done
     if (( ${#profiles[@]} == 0 )); then echo 'No tunnels configured.'; return 0; fi
     echo '0  Back'
@@ -399,4 +458,4 @@ advanced_menu(){
 }
 
 [[ ${EUID:-$(id -u)} -eq 0 ]] || die "Run as root"
-case ${1:-menu} in --local) [[ -n ${2:-} ]] || die "Usage: $0 --local DIR"; install_local "$2";; --github) install_github;; --hub) create_hub;; --edge) create_edge;; --rollback) rollback;; menu) menu;; *) die "Usage: $0 [menu|--github|--local DIR|--hub|--edge|--rollback]";; esac
+case ${1:-menu} in --local) [[ -n ${2:-} ]] || die "Usage: $0 --local DIR"; install_local "$2";; --github) install_github;; --hub) create_hub;; --edge) create_edge;; --rollback) rollback;; menu) bootstrap_menu;; *) die "Usage: $0 [menu|--github|--local DIR|--hub|--edge|--rollback]";; esac
