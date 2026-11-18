@@ -25,6 +25,9 @@ layout(){
 activate(){
   local release_dir=$1 old=""
   [[ -x "$release_dir/zoodtunneld" && -x "$release_dir/zoodtunnelctl" ]] || die "Release binaries are missing"
+  for binary in zoodtunneld zoodtunnelctl; do
+    "$release_dir/$binary" --help >/dev/null || die "Core cannot run on this server. Install the static musl package for $(uname -m)."
+  done
   [[ ! -L $CURRENT ]] || old="$(readlink -f "$CURRENT")"
   [[ -z $old ]] || ln -sfn "$old" "$PREVIOUS"
   ln -sfn "$release_dir" "$CURRENT"
@@ -38,7 +41,9 @@ install_local(){
   local source_dir=${1:?local binary directory required} release_dir
   layout; release_dir="$INSTALL_ROOT/releases/local-$(date +%Y%m%d%H%M%S)"; install -d -m 0755 "$release_dir"
   install -m 0755 "$source_dir/zoodtunneld" "$source_dir/zoodtunnelctl" "$release_dir/"
-  install -m 0644 "$SCRIPT_DIR/zoodtunnel@.service" "$release_dir/"
+  local unit="$source_dir/zoodtunnel@.service"
+  [[ -f $unit ]] || unit="$SCRIPT_DIR/zoodtunnel@.service"
+  install -m 0644 "$unit" "$release_dir/"
   activate "$release_dir"; echo "Local build installed."
 }
 
@@ -48,9 +53,15 @@ install_github(){
   target="$(arch)"; version="${ZOODTUNNEL_VERSION:-nightly}"
   archive="$(mktemp)"; sums="$(mktemp)"
   local base="https://github.com/$REPO/releases"; [[ $version == latest ]] && base+="/latest/download" || base+="/download/$version"
-  curl -fL --retry 3 "$base/zoodtunnel-$target.tar.gz" -o "$archive"
-  curl -fL --retry 3 "$base/SHA256SUMS" -o "$sums"
-  grep "zoodtunnel-$target.tar.gz" "$sums" | sed "s#zoodtunnel-$target.tar.gz#$(basename "$archive")#" | (cd "$(dirname "$archive")" && sha256sum -c -)
+  local -a headers=()
+  [[ -z ${token:-} ]] || headers=(-H "Authorization: Bearer $token")
+  curl -fsSL --retry 3 "${headers[@]}" "$base/SHA256SUMS" -o "$sums"
+  local portable="${target%-gnu}-musl" digest
+  if awk -v f="zoodtunnel-$portable.tar.gz" '$2==f {found=1} END {exit !found}' "$sums"; then target="$portable"; fi
+  digest="$(awk -v f="zoodtunnel-$target.tar.gz" '$2==f {print $1}' "$sums")"
+  [[ $digest =~ ^[[:xdigit:]]{64}$ ]] || die "Release checksum unavailable for $target"
+  curl -fsSL --retry 3 "${headers[@]}" "$base/zoodtunnel-$target.tar.gz" -o "$archive"
+  printf '%s  %s\n' "$digest" "$archive" | sha256sum -c -
   layout; release_dir="$INSTALL_ROOT/releases/$(date +%Y%m%d%H%M%S)-$target"; install -d -m 0755 "$release_dir"
   tar -xzf "$archive" -C "$release_dir"; rm -f "$archive" "$sums"; activate "$release_dir"
   systemctl list-unit-files 'zoodtunnel@*.service' --no-legend 2>/dev/null |
@@ -226,6 +237,7 @@ quick_setup()(
   umask 077
   local role=$1 profile=paired secret peer="" port ports item public target proto listen tmp cfg identity
   need openssl; need python3
+  if ! zoodtunneld --help >/dev/null 2>&1 || ! zoodtunnelctl --help >/dev/null 2>&1; then install_github; fi
   port="$(ask 'Carrier UDP port (same on both servers)' 4433)"
   [[ $port =~ ^[1-9][0-9]{0,4}$ && $port -le 65535 ]] || die 'Invalid carrier port'
   listen="0.0.0.0:$port"
@@ -272,7 +284,6 @@ quick_setup()(
       done
     done
   } >"$tmp/profile.toml"
-  command -v zoodtunneld >/dev/null || install_github
   mkdir -m 0750 "$identity" || die 'Pairing directory already exists'
   trap 'rm -rf "$tmp" "$identity"' EXIT
   chgrp zoodtunnel "$identity"
@@ -284,21 +295,31 @@ quick_setup()(
 )
 
 menu(){
-  echo "ZoodTunnel"
-  echo "1) Set up target server (runs the service)"
-  echo "2) Set up listener server (accepts users)"
-  echo "3) Status"
-  echo "4) Advanced / existing certificates"
-  echo "0) Exit"
-  read -r -p "Select: " choice
-  case "$choice" in
-    1) quick_setup hub ;;
-    2) quick_setup edge ;;
-    3) systemctl --no-pager --full status 'zoodtunnel@*' || true ;;
-    4) advanced_menu ;;
-    0) return ;;
-    *) die "Invalid selection" ;;
-  esac
+  local choice role core count active title reset
+  title=""; reset=""
+  if [[ -t 1 && -z ${NO_COLOR:-} ]]; then title=$'\033[1;36m'; reset=$'\033[0m'; fi
+  while true; do
+    core="Not installed"
+    if command -v zoodtunneld >/dev/null; then
+      if zoodtunneld --help >/dev/null 2>&1; then core="Ready"; else core="Needs repair"; fi
+    fi
+    count=0
+    for cfg in "$PROFILE_DIR"/*.toml; do if [[ -f $cfg ]]; then ((count+=1)); fi; done
+    active="$(systemctl list-units --state=active --type=service --no-legend 'zoodtunnel@*.service' 2>/dev/null | awk 'END {print NR}')" || active="?"
+    printf '\n%sZoodTunnel  /  Tunnel manager%s\n' "$title" "$reset"
+    printf 'Core: %s   Profiles: %s   Active: %s\n\n' "$core" "$count" "$active"
+    printf '  1  Create tunnel\n  2  Show tunnel status\n  3  Advanced options\n  0  Exit\n'
+    read -rp 'Select [0-3]: ' choice || return 0
+    case "$choice" in
+      1) printf '\nWhich server is this?\n  1  Outside Iran (runs Xray or target service)\n  2  Iran (accepts user connections)\n  0  Back\n'
+         read -rp 'Select [0-2]: ' role || return 0
+         case "$role" in 1) quick_setup hub ;; 2) quick_setup edge ;; 0) continue ;; *) echo 'Choose 0, 1 or 2.' ;; esac ;;
+      2) systemctl --no-pager --full status 'zoodtunnel@*' || true ;;
+      3) advanced_menu ;;
+      0) return 0 ;;
+      *) echo 'Choose a number from 0 to 3.' ;;
+    esac
+  done
 }
 
 advanced_menu(){
