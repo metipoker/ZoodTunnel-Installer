@@ -1,0 +1,55 @@
+name: Installer smoke test
+on:
+  pull_request:
+    paths: [install.sh, .github/workflows/installer.yml]
+  push:
+    branches: [main, feature/simple-paired-setup]
+    paths: [install.sh, .github/workflows/installer.yml]
+permissions:
+  contents: read
+jobs:
+  bootstrap:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the public release on a fresh host
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo bash install.sh <<<0 | tee first-run.log
+          grep -F 'Core: Ready' first-run.log
+          /usr/local/bin/zoodtunneld --help >/dev/null
+          /usr/local/bin/zoodtunnelctl --help >/dev/null
+          systemctl cat zoodtunnel@.service >/dev/null
+          first_release=$(readlink -e /opt/zoodtunnel/current)
+          sudo env ZOODTUNNEL_VERSION=absent-for-offline-check bash install.sh <<<0 | tee second-run.log
+          grep -F 'Core: Ready' second-run.log
+          test "$(readlink -e /opt/zoodtunnel/current)" = "$first_release"
+      - name: Manage a real tunnel service
+        shell: bash
+        run: |
+          set -euo pipefail
+          unit=zoodtunnel@paired.service
+          key=$(openssl rand -hex 32)
+          printf '1\n1\n4433\n18080\n%s\n0\n' "$key" | sudo bash install.sh
+          for attempt in {1..15}; do
+            if curl -fsS --max-time 2 http://127.0.0.1:9188/readyz; then break; fi
+            sleep 1
+          done
+          curl -fsS --max-time 2 http://127.0.0.1:9188/readyz
+          systemctl is-active "$unit"
+          manage(){ printf '2\n1\n%s\n0\n0\n0\n' "$1" | sudo bash install.sh; }
+          manage 3
+          test "$(systemctl is-active "$unit")" = inactive
+          manage 2
+          systemctl is-active "$unit"
+          manage 4
+          systemctl is-active "$unit"
+          printf '2\n1\n7\npaired\n0\n' | sudo bash install.sh
+          sudo test ! -e /etc/zoodtunnel/profiles/paired.toml
+          test "$(systemctl is-active "$unit")" = inactive
