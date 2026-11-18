@@ -260,6 +260,7 @@ quick_setup()(
   layout
   cfg="$PROFILE_DIR/$profile.toml"
   identity="$PKI_DIR/$profile-pair"
+  if [[ -e $identity ]]; then identity="$PKI_DIR/$profile-pair-$(openssl rand -hex 8)"; fi
   [[ ! -e $cfg ]] || die 'Paired profile already exists'
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
@@ -294,6 +295,75 @@ quick_setup()(
   systemctl enable --now "zoodtunnel@$profile"
 )
 
+edit_profile()(
+  local cfg=$1 unit=$2 tmp backup
+  tmp=$(mktemp "$PROFILE_DIR/.edit.XXXXXXXX") || return 1
+  backup=$(mktemp "$PROFILE_DIR/.previous.XXXXXXXX") || { rm -f "$tmp"; return 1; }
+  trap 'rm -f "$tmp" "$backup"' EXIT
+  cp -p -- "$cfg" "$tmp" && cp -p -- "$cfg" "$backup" || return 1
+  "${EDITOR:-vi}" "$tmp" || return 1
+  cmp -s "$cfg" "$tmp" && return 0
+  zoodtunneld --config "$tmp" --check || return 1
+  chmod --reference="$cfg" "$tmp" && chown --reference="$cfg" "$tmp" || return 1
+  mv -fT -- "$tmp" "$cfg" || return 1
+  if systemctl is-active --quiet "$unit" && ! systemctl restart "$unit"; then
+    mv -fT -- "$backup" "$cfg" && systemctl start "$unit"
+    return 1
+  fi
+)
+
+profile_actions(){
+  local cfg=$1 name unit choice confirm
+  name=${cfg##*/}; name=${name%.toml}; unit="zoodtunnel@$name.service"
+  while [[ -f $cfg ]]; do
+    printf '\nManage %s\n' "$name"
+    printf '1  Status\n2  Start\n3  Stop\n4  Restart\n5  Live logs (Ctrl+C to return)\n6  Edit config\n7  Remove tunnel\n8  Enable at boot\n9  Disable at boot\n0  Back\n'
+    read -rp 'Action: ' choice || return 0
+    case "$choice" in
+      1) systemctl --no-pager --full status "$unit" || : ;;
+      2) systemctl start "$unit" || echo 'Start failed. Check logs.' ;;
+      3) systemctl stop "$unit" || echo 'Stop failed.' ;;
+      4) systemctl restart "$unit" || echo 'Restart failed. Check logs.' ;;
+      5) (trap 'exit 0' INT; journalctl --no-pager -fu "$unit" -n 30) || : ;;
+      6) edit_profile "$cfg" "$unit" || echo 'Edit or restart failed; check the output above.' ;;
+      7) printf 'Stop and disable %s, then delete its profile on this server.\n' "$name"
+         read -rp "Type $name to remove (Enter to cancel): " confirm || return 0
+         [[ $confirm == "$name" ]] || continue
+         systemctl stop "$unit" && systemctl disable "$unit" && rm -- "$cfg" && return 0
+         echo 'Removal incomplete. Check the output above.' ;;
+      8) systemctl enable "$unit" || echo 'Enable failed.' ;;
+      9) systemctl disable "$unit" || echo 'Disable failed.' ;;
+      0) return 0 ;;
+      *) echo 'Choose 0 to 9.' ;;
+    esac
+  done
+}
+
+manage_profiles(){
+  local cfg name choice
+  local -a profiles
+  while true; do
+    profiles=()
+    printf '\nTunnels on this server\n'
+    for cfg in "$PROFILE_DIR"/*.toml; do
+      [[ -f $cfg && ! -L $cfg ]] || continue
+      name=${cfg##*/}; name=${name%.toml}
+      [[ $name =~ ^[A-Za-z0-9_-]{1,64}$ ]] || continue
+      profiles+=("$cfg")
+      printf '%d  %s\n' "${#profiles[@]}" "$name"
+    done
+    if (( ${#profiles[@]} == 0 )); then echo 'No tunnels configured.'; return 0; fi
+    echo '0  Back'
+    read -rp 'Tunnel: ' choice || return 0
+    [[ $choice != 0 ]] || return 0
+    if [[ $choice =~ ^[1-9][0-9]{0,5}$ ]] && (( choice <= ${#profiles[@]} )); then
+      profile_actions "${profiles[choice-1]}"
+    else
+      echo 'Choose a listed tunnel.'
+    fi
+  done
+}
+
 menu(){
   local choice role core count active title reset
   title=""; reset=""
@@ -308,13 +378,13 @@ menu(){
     active="$(systemctl list-units --state=active --type=service --no-legend 'zoodtunnel@*.service' 2>/dev/null | awk 'END {print NR}')" || active="?"
     printf '\n%sZoodTunnel  /  Tunnel manager%s\n' "$title" "$reset"
     printf 'Core: %s   Profiles: %s   Active: %s\n\n' "$core" "$count" "$active"
-    printf '  1  Create tunnel\n  2  Show tunnel status\n  3  Advanced options\n  0  Exit\n'
+    printf '  1  Create tunnel\n  2  Manage tunnels\n  3  Advanced options\n  0  Exit\n'
     read -rp 'Select [0-3]: ' choice || return 0
     case "$choice" in
       1) printf '\nWhich server is this?\n  1  Outside Iran (runs Xray or target service)\n  2  Iran (accepts user connections)\n  0  Back\n'
          read -rp 'Select [0-2]: ' role || return 0
          case "$role" in 1) quick_setup hub ;; 2) quick_setup edge ;; 0) continue ;; *) echo 'Choose 0, 1 or 2.' ;; esac ;;
-      2) systemctl --no-pager --full status 'zoodtunnel@*' || true ;;
+      2) manage_profiles ;;
       3) advanced_menu ;;
       0) return 0 ;;
       *) echo 'Choose a number from 0 to 3.' ;;
