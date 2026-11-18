@@ -200,7 +200,108 @@ rollback(){
   echo "Rolled back to $old"
 }
 
+# A random pairing key bootstraps the same trust anchor on both hosts.
+# Each endpoint generates its own leaf private key. TLS still authenticates both peers.
+pair_identity(){
+  local dir=$1 role=$2 secret=$3 usage=serverAuth
+  [[ $role == hub ]] || usage=clientAuth
+  printf '%s' "$secret" | python3 -c '
+import hashlib, hmac, sys
+key = bytes.fromhex(sys.stdin.read())
+seed = hmac.digest(key, b"ZoodTunnel pairing CA v1", hashlib.sha256)
+sys.stdout.buffer.write(bytes.fromhex("302e020100300506032b657004220420") + seed)
+' >"$dir/issuer.der"
+  openssl pkey -inform DER -in "$dir/issuer.der" -out "$dir/issuer.key"
+  openssl req -new -x509 -key "$dir/issuer.key" -subj /CN=ZoodTunnel-Pair-v1 -days 3650 -set_serial 1 \
+    -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' -addext 'keyUsage=critical,keyCertSign' -out "$dir/ca.crt"
+  openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$dir/leaf.key"
+  openssl req -new -key "$dir/leaf.key" -subj "/CN=$role.local" -out "$dir/leaf.csr"
+  printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=%s\nsubjectAltName=DNS:%s.local\n' "$usage" "$role" >"$dir/extensions"
+  openssl x509 -req -in "$dir/leaf.csr" -CA "$dir/ca.crt" -CAkey "$dir/issuer.key" -days 825 -extfile "$dir/extensions" -out "$dir/leaf.crt"
+  rm "$dir/issuer.der" "$dir/issuer.key" "$dir/leaf.csr" "$dir/extensions"
+}
+
+quick_setup()(
+  set +x
+  umask 077
+  local role=$1 profile=paired secret peer="" port ports item public target proto listen tmp cfg identity
+  need openssl; need python3
+  port="$(ask 'Carrier UDP port (same on both servers)' 4433)"
+  [[ $port =~ ^[1-9][0-9]{0,4}$ && $port -le 65535 ]] || die 'Invalid carrier port'
+  listen="0.0.0.0:$port"
+  if [[ $role == edge ]]; then
+    peer="$(ask 'Target server IPv4 address')"
+    python3 -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$peer" || die 'Invalid address'
+    listen=127.0.0.1:0
+  fi
+  ports="$(ask 'Ports on both servers (8080,8880 or public=target)' 8080)"
+  [[ $ports =~ ^[0-9=]+(,[0-9=]+)*$ ]] || die 'Invalid ports'
+  local prompt='Pairing key from target server'
+  [[ $role != hub ]] || prompt='Pairing key (Enter to generate)'
+  read -rs -p "$prompt: " secret
+  echo
+  if [[ $role == hub && -z $secret ]]; then
+    secret="$(openssl rand -hex 32)"
+    printf 'Pairing key for the listener server: %s\n' "$secret" >/dev/tty
+  fi
+  [[ $secret =~ ^[[:xdigit:]]{64}$ ]] || die 'Expected a 32-byte hex pairing key'
+  layout
+  cfg="$PROFILE_DIR/$profile.toml"
+  identity="$PKI_DIR/$profile-pair"
+  [[ ! -e $cfg ]] || die 'Paired profile already exists'
+  tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' EXIT
+  pair_identity "$tmp" "$role" "$secret"
+  unset secret
+  {
+    printf 'profile = "%s"\nmode = "%s"\ntransport = "quic"\nlisten = "%s"\n' "$profile" "$role" "$listen"
+    if [[ $role == edge ]]; then printf 'peer = "%s:%s"\n' "$peer" "$port"; fi
+    printf '[tls]\ncert_file = "%s/leaf.crt"\nkey_file = "%s/leaf.key"\nca_file = "%s/ca.crt"\n' "$identity" "$identity" "$identity"
+    if [[ $role == edge ]]; then echo 'server_name = "hub.local"'; fi
+    IFS=, read -ra mappings <<<"$ports"
+    for item in "${mappings[@]}"; do
+      public=${item%%=*}; target=${item##*=}
+      [[ $item == "$public" || $item == "$public=$target" ]] || die 'Invalid mapping'
+      for number in "$public" "$target"; do
+        [[ $number =~ ^[1-9][0-9]{0,4}$ && $number -le 65535 ]] || die 'Invalid port'
+      done
+      for proto in tcp udp; do
+        local bind=127.0.0.1:0
+        [[ $role == hub ]] || bind="0.0.0.0:$public"
+        printf '[[forwards]]\nname = "p%s-%s"\nprotocol = "%s"\nbind = "%s"\ntarget = "127.0.0.1:%s"\n' "$public" "$proto" "$proto" "$bind" "$target"
+      done
+    done
+  } >"$tmp/profile.toml"
+  command -v zoodtunneld >/dev/null || install_github
+  mkdir -m 0750 "$identity" || die 'Pairing directory already exists'
+  trap 'rm -rf "$tmp" "$identity"' EXIT
+  chgrp zoodtunnel "$identity"
+  install -m 0640 -g zoodtunnel "$tmp"/{ca.crt,leaf.crt,leaf.key} "$identity/"
+  zoodtunneld --config "$tmp/profile.toml" --check
+  install -m 0640 -g zoodtunnel "$tmp/profile.toml" "$cfg"
+  trap 'rm -rf "$tmp"' EXIT
+  systemctl enable --now "zoodtunnel@$profile"
+)
+
 menu(){
+  echo "ZoodTunnel"
+  echo "1) Set up target server (runs the service)"
+  echo "2) Set up listener server (accepts users)"
+  echo "3) Status"
+  echo "4) Advanced / existing certificates"
+  echo "0) Exit"
+  read -r -p "Select: " choice
+  case "$choice" in
+    1) quick_setup hub ;;
+    2) quick_setup edge ;;
+    3) systemctl --no-pager --full status 'zoodtunnel@*' || true ;;
+    4) advanced_menu ;;
+    0) return ;;
+    *) die "Invalid selection" ;;
+  esac
+}
+
+advanced_menu(){
   echo "ZoodTunnel installer / manager"; echo "1) Install or update from GitHub"; echo "2) Create Target/Hub profile (service side)"; echo "3) Create Listener/Edge profile (public-port side)"; echo "4) Show status"; echo "5) Roll back binary"; echo "0) Exit"
   read -r -p "Select: " choice
   case "$choice" in 1) install_github;; 2) create_hub;; 3) create_edge;; 4) systemctl --no-pager --full status 'zoodtunnel@*' || true;; 5) rollback;; 0) exit 0;; *) die "Invalid selection";; esac
