@@ -1,0 +1,32 @@
+name: Installer smoke test
+on:
+  pull_request:
+    paths: [install.sh, .github/workflows/installer.yml]
+  push:
+    branches: [main, feature/simple-paired-setup]
+    paths: [install.sh, .github/workflows/installer.yml]
+permissions:
+  contents: read
+jobs:
+  bootstrap:
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the public release on a fresh host
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo bash install.sh <<<0 | tee first-run.log
+          grep -F 'Core: Ready' first-run.log
+          /usr/local/bin/zoodtunneld --help >/dev/null
+          /usr/local/bin/zoodtunnelctl --help >/dev/null
+          systemctl cat zoodtunnel@.service >/dev/null
+          first_release=$(readlink -e /opt/zoodtunnel/current)
+          sudo env ZOODTUNNEL_VERSION=absent-for-offline-check bash install.sh <<<0 | tee second-run.log
+          grep -F 'Core: Ready' second-run.log
+          test "$(readlink -e /opt/zoodtunnel/current)" = "$first_release"
