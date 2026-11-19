@@ -1,0 +1,42 @@
+name: Reverse installer compatibility
+on:
+  push:
+    branches: [compat/reverse-preview-v2]
+  workflow_dispatch:
+    inputs:
+      asset_tag:
+        description: Published release to install
+        default: reverse-preview-v2
+        type: string
+permissions:
+  contents: read
+env:
+  ZOODTUNNEL_VERSION: ${{ inputs.asset_tag || 'reverse-preview-v1' }}
+jobs:
+  distribution:
+    name: ${{ matrix.image }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - ubuntu:20.04
+          - ubuntu:22.04
+          - ubuntu:24.04
+          - ubuntu:26.04
+          - ubuntu:26.10
+          - quay.io/centos/centos:stream9
+          - quay.io/centos/centos:stream10
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          docker run --rm --volume "$GITHUB_WORKSPACE:/source:ro" \
+            --env ZOODTUNNEL_VERSION "${{ matrix.image }}" \
+            bash /source/tests/reverse-compat.sh container
+  systemd:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - run: sudo --preserve-env=ZOODTUNNEL_VERSION bash tests/reverse-compat.sh native

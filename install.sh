@@ -2,6 +2,7 @@
 set -Eeuo pipefail
 
 REPO="${ZOODTUNNEL_REPO:-metipoker/ZoodTunnel-Installer}"
+INSTALLER_RELEASE=reverse-preview-v2
 INSTALL_ROOT=/opt/zoodtunnel
 CURRENT="$INSTALL_ROOT/current"
 PREVIOUS="$INSTALL_ROOT/previous"
@@ -16,11 +17,19 @@ arch(){ case "$(uname -m)" in x86_64|amd64) echo x86_64-unknown-linux-gnu;; aarc
 
 prepare_server(){
   [[ $(uname -s) == Linux ]] || die 'ZoodTunnel requires Linux'
-  local target family="" os manager certs pkg i
+  local target family="" os manager certs pkg i major
   local -a commands packages missing=()
   target=$(arch)
   [[ -r /etc/os-release ]] || die 'Missing /etc/os-release'
   . /etc/os-release
+  major=${VERSION_ID:-}
+  major=${major%%.*}
+  if [[ ${ID:-} == ubuntu && $major =~ ^[0-9]+$ && $major -lt 20 ]]; then
+    die 'Ubuntu 20.04 or newer is required'
+  fi
+  if [[ ${ID:-} == centos && $major =~ ^[0-9]+$ && $major -lt 9 ]]; then
+    die 'CentOS Stream 9 or newer is required'
+  fi
   for os in ${ID:-} ${ID_LIKE:-}; do
     case "$os" in
       debian|ubuntu) family=deb; break ;;
@@ -58,12 +67,17 @@ prepare_server(){
   fi
   for i in "${commands[@]}"; do need "$i"; done
   [[ -s $certs ]] || die 'System CA bundle unavailable'
+  python3 -c 'import hashlib, hmac, ipaddress, sys; sys.exit(sys.version_info < (3, 6))' ||
+    die 'Python 3.6 or newer with its standard library is required'
+  openssl genpkey -algorithm ED25519 >/dev/null 2>&1 ||
+    die 'OpenSSL Ed25519 support is required for tunnel pairing'
 }
 
 bootstrap_menu(){
   prepare_server
-  local expected_release="$REPO:${ZOODTUNNEL_VERSION:-reverse-preview-v1}"
-  if [[ ! -r "$CURRENT/.release-id" ]] || [[ $(<"$CURRENT/.release-id") != "$expected_release" ]] ||
+  local expected_release="$REPO:${ZOODTUNNEL_VERSION:-$INSTALLER_RELEASE}"
+  if { [[ $INSTALLER_RELEASE != nightly ]] &&
+       { [[ ! -r "$CURRENT/.release-id" ]] || [[ $(<"$CURRENT/.release-id") != "$expected_release" ]]; }; } ||
      ! zoodtunneld --help >/dev/null 2>&1 || ! zoodtunnelctl --help >/dev/null 2>&1 ||
      ! systemctl cat zoodtunnel@.service >/dev/null 2>&1; then
     install_github
@@ -109,14 +123,18 @@ install_local(){
 install_github()(
   need curl; need tar; need sha256sum
   local target archive sums release_dir version
-  target="$(arch)"; version="${ZOODTUNNEL_VERSION:-reverse-preview-v1}"
+  target="$(arch)"; version="${ZOODTUNNEL_VERSION:-$INSTALLER_RELEASE}"
   local tmp
   tmp=$(mktemp -d); trap 'rm -rf -- "$tmp"' EXIT
   archive="$tmp/release.tar.gz"; sums="$tmp/SHA256SUMS"
   local base="https://github.com/$REPO/releases"; [[ $version == latest ]] && base+="/latest/download" || base+="/download/$version"
   curl -fsSL --retry 3 "$base/SHA256SUMS" -o "$sums"
   local portable="${target%-gnu}-musl" digest
-  if awk -v f="zoodtunnel-$portable.tar.gz" '$2==f {found=1} END {exit !found}' "$sums"; then target="$portable"; fi
+  if awk -v f="zoodtunnel-$portable.tar.gz" '$2==f {found=1} END {exit !found}' "$sums"; then
+    target="$portable"
+  elif [[ $INSTALLER_RELEASE != nightly ]]; then
+    die "No static release package is available for $(uname -m)"
+  fi
   digest="$(awk -v f="zoodtunnel-$target.tar.gz" '$2==f {print $1}' "$sums")"
   [[ $digest =~ ^[[:xdigit:]]{64}$ ]] || die "Release checksum unavailable for $target"
   curl -fsSL --retry 3 "$base/zoodtunnel-$target.tar.gz" -o "$archive"
@@ -280,7 +298,7 @@ pair_identity(){
   printf '%s' "$secret" | python3 -c '
 import hashlib, hmac, sys
 key = bytes.fromhex(sys.stdin.read())
-seed = hmac.digest(key, b"ZoodTunnel pairing CA v1", hashlib.sha256)
+seed = hmac.new(key, b"ZoodTunnel pairing CA v1", hashlib.sha256).digest()
 sys.stdout.buffer.write(bytes.fromhex("302e020100300506032b657004220420") + seed)
 ' >"$dir/issuer.der"
   openssl pkey -inform DER -in "$dir/issuer.der" -out "$dir/issuer.key"
@@ -321,9 +339,8 @@ try:
             mappings[port] = service
 except ValueError:
     sys.exit("Use unique ports in 1-65535 and equal-size ranges, up to 256 mappings.")
-sys.stdout.reconfigure(newline="\n")
 for port, service in mappings.items():
-    print(f"{port}={service}")
+    sys.stdout.buffer.write(f"{port}={service}\n".encode("ascii"))
 ' "$1"
 }
 
