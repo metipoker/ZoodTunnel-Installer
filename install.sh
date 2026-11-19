@@ -62,7 +62,9 @@ prepare_server(){
 
 bootstrap_menu(){
   prepare_server
-  if ! zoodtunneld --help >/dev/null 2>&1 || ! zoodtunnelctl --help >/dev/null 2>&1 ||
+  local expected_release="$REPO:${ZOODTUNNEL_VERSION:-reverse-preview-v1}"
+  if [[ ! -r "$CURRENT/.release-id" ]] || [[ $(<"$CURRENT/.release-id") != "$expected_release" ]] ||
+     ! zoodtunneld --help >/dev/null 2>&1 || ! zoodtunnelctl --help >/dev/null 2>&1 ||
      ! systemctl cat zoodtunnel@.service >/dev/null 2>&1; then
     install_github
   fi
@@ -107,7 +109,7 @@ install_local(){
 install_github()(
   need curl; need tar; need sha256sum
   local target archive sums release_dir version
-  target="$(arch)"; version="${ZOODTUNNEL_VERSION:-nightly}"
+  target="$(arch)"; version="${ZOODTUNNEL_VERSION:-reverse-preview-v1}"
   local tmp
   tmp=$(mktemp -d); trap 'rm -rf -- "$tmp"' EXIT
   archive="$tmp/release.tar.gz"; sums="$tmp/SHA256SUMS"
@@ -121,6 +123,7 @@ install_github()(
   printf '%s  %s\n' "$digest" "$archive" | sha256sum -c -
   layout; release_dir=$(mktemp -d "$INSTALL_ROOT/releases/$target.XXXXXXXX"); chmod 0755 "$release_dir"
   tar -xzf "$archive" -C "$release_dir"; [[ -f $release_dir/zoodtunnel@.service ]] || die "Release missing service template"
+  printf '%s\n' "$REPO:$version" >"$release_dir/.release-id"
   activate "$release_dir"
   systemctl list-units --state=active --plain 'zoodtunnel@*.service' --no-legend 2>/dev/null |
     awk '$1 ~ /^zoodtunnel@.+\.service$/ {print $1}' | xargs -r systemctl restart
@@ -290,31 +293,165 @@ sys.stdout.buffer.write(bytes.fromhex("302e020100300506032b657004220420") + seed
   rm "$dir/issuer.der" "$dir/issuer.key" "$dir/leaf.csr" "$dir/extensions"
 }
 
+expand_port_mappings(){
+  python3 -c '
+import re
+import sys
+
+def ports(value):
+    if not re.fullmatch(r"[1-9][0-9]{0,4}(?:-[1-9][0-9]{0,4})?", value):
+        raise ValueError()
+    start, _, end = value.partition("-")
+    first, last = int(start), int(end or start)
+    if not 1 <= first <= last <= 65535:
+        raise ValueError()
+    return range(first, last + 1)
+
+mappings = {}
+try:
+    for entry in sys.argv[1].split(","):
+        public, _, target = entry.strip().partition("=")
+        source = ports(public)
+        destination = ports(target if "=" in entry else public)
+        if len(source) != len(destination) or len(mappings) + len(source) > 256:
+            raise ValueError()
+        for port, service in zip(source, destination):
+            if port in mappings:
+                raise ValueError()
+            mappings[port] = service
+except ValueError:
+    sys.exit("Use unique ports in 1-65535 and equal-size ranges, up to 256 mappings.")
+sys.stdout.reconfigure(newline="\n")
+for port, service in mappings.items():
+    print(f"{port}={service}")
+' "$1"
+}
+
 quick_setup()(
   set +x
   umask 077
-  local role=$1 profile=paired secret peer="" port ports item public target proto listen tmp cfg identity
+  local role=$1 kind=$2 profile=$3 secret peer='' port ports mappings public target proto listen tmp cfg identity
+  local transport choice reverse=false initiates=false tls_role=$role health_port=0
+  local quic_mtu='' tun_address tun_default tun_mtu tun_name connections queue idle
   need openssl; need python3
   if ! zoodtunneld --help >/dev/null 2>&1 || ! zoodtunnelctl --help >/dev/null 2>&1; then install_github; fi
-  port="$(ask 'Carrier UDP port (same on both servers)' 4433)"
-  [[ $port =~ ^[1-9][0-9]{0,4}$ && $port -le 65535 ]] || die 'Invalid carrier port'
-  listen="0.0.0.0:$port"
+  [[ ! -e "$PROFILE_DIR/$profile.toml" ]] || { echo "Tunnel '$profile' already exists."; return 0; }
   if [[ $role == edge ]]; then
-    peer="$(ask 'Target server IPv4 address')"
-    python3 -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$peer" || die 'Invalid address'
-    listen=127.0.0.1:0
+    peer="$(ask 'Outside server IPv4')"
+  else
+    peer="$(ask 'Iran server IPv4 (for reverse mode, optional for normal mode)')"
   fi
-  ports="$(ask 'Ports on both servers (8080,8880 or public=target)' 8080)"
-  [[ $ports =~ ^[0-9=]+(,[0-9=]+)*$ ]] || die 'Invalid ports'
-  local prompt='Pairing key from target server'
-  [[ $role != hub ]] || prompt='Pairing key (Enter to generate)'
-  read -rs -p "$prompt: " secret
-  echo
-  if [[ $role == hub && -z $secret ]]; then
-    secret="$(openssl rand -hex 32)"
-    printf 'Pairing key for the listener server: %s\n' "$secret" >/dev/tty
+  if [[ $role == edge || -n $peer ]]; then
+    python3 -c 'import ipaddress,sys; ipaddress.IPv4Address(sys.argv[1])' "$peer" 2>/dev/null ||
+      die 'Invalid peer IPv4 address'
   fi
-  [[ $secret =~ ^[[:xdigit:]]{64}$ ]] || die 'Expected a 32-byte hex pairing key'
+  port="$(ask 'Carrier port (same on both servers)' 4433)"
+  [[ $port =~ ^[1-9][0-9]{0,4}$ && $port -le 65535 ]] || die 'Invalid carrier port'
+  if [[ $kind == services ]]; then
+    printf '\nCarrier selection\n  1  Automatic (QUIC, then TCP/TLS)\n  2  Custom\n  0  Back\n'
+    while true; do
+      read -rp 'Select [0-2, default 1]: ' choice || return 0
+      case "${choice:-1}" in
+        0) return 0 ;;
+        1) transport=auto; break ;;
+        2) transport=''; break ;;
+        *) echo 'Choose a listed carrier selection.' ;;
+      esac
+    done
+  fi
+  if [[ -z ${transport:-} ]]; then
+    printf '\nCustom carrier\n  1  QUIC over UDP\n  2  TLS over TCP\n  0  Back\n'
+    while true; do
+      read -rp 'Select [0-2, default 1]: ' choice || return 0
+      case "${choice:-1}" in
+        0) return 0 ;;
+        1) transport=quic; break ;;
+        2) transport=tcp_tls; break ;;
+        *) echo 'Choose a listed carrier.' ;;
+      esac
+    done
+  fi
+  if [[ $kind == services && $transport == quic ]]; then
+    printf '\nConnection direction\n  1  Normal (Iran to outside)\n  2  Reverse (outside to Iran)\n  0  Back\n'
+    while true; do
+      read -rp 'Select [0-2, default 1]: ' choice || return 0
+      case "${choice:-1}" in
+        0) return 0 ;;
+        1) break ;;
+        2)
+          if [[ -z $peer ]]; then
+            echo 'Reverse mode requires the Iran server IPv4. Start setup again to enter it.'
+            return 0
+          fi
+          reverse=true
+          break
+          ;;
+        *) echo 'Choose a listed direction.' ;;
+      esac
+    done
+  else
+    printf '\nDirection: Iran to outside. Reverse uses Custom QUIC for service forwarding.\n'
+  fi
+  if [[ $reverse == true ]]; then
+    if [[ $role == edge ]]; then tls_role=hub; else tls_role=edge; fi
+  fi
+  listen="0.0.0.0:$port"
+  if [[ $tls_role == edge ]]; then initiates=true; listen=127.0.0.1:0; fi
+  [[ $profile != paired ]] || health_port=9188
+
+  printf '\nPerformance profile\n  1  Balanced\n  2  Interactive\n  3  High capacity\n  4  Economy\n  0  Back\n'
+  while true; do
+    read -rp 'Select [0-4, default 1]: ' choice || return 0
+    case "${choice:-1}" in
+      0) return 0 ;;
+      1) connections=20000; queue=1024; idle=120; break ;;
+      2) connections=8192; queue=256; idle=60; break ;;
+      3) connections=32000; queue=2048; idle=180; break ;;
+      4) connections=1024; queue=128; idle=60; break ;;
+      *) echo 'Choose a listed profile.' ;;
+    esac
+  done
+  if [[ $transport != tcp_tls ]]; then
+    quic_mtu="$(ask 'QUIC initial UDP payload MTU (1200-1472)' 1200)"
+    [[ $quic_mtu =~ ^[1-9][0-9]{3}$ && $quic_mtu -ge 1200 && $quic_mtu -le 1472 ]] ||
+      die 'Invalid QUIC MTU'
+  fi
+  if [[ $kind == tun ]]; then
+    tun_mtu="$(ask 'TUN interface MTU (576-9000)' 1280)"
+    [[ $tun_mtu =~ ^[1-9][0-9]{2,3}$ && $tun_mtu -ge 576 && $tun_mtu -le 9000 ]] ||
+      die 'Invalid TUN MTU'
+    tun_default=10.77.0.1/30
+    [[ $role != edge ]] || tun_default=10.77.0.2/30
+    tun_address="$(ask 'Local TUN IPv4 address/prefix' "$tun_default")"
+    [[ $tun_address =~ ^[0-9.]+/[0-9]+$ ]] &&
+      python3 -c 'import ipaddress,sys; ipaddress.IPv4Interface(sys.argv[1])' "$tun_address" 2>/dev/null ||
+      die 'Invalid TUN IPv4 address/prefix'
+    tun_name="$(printf '%s' "$profile" | sha256sum)"
+    tun_name="zt${tun_name:0:12}"
+    [[ $profile != paired ]] || tun_name=ztpaired
+  else
+    ports="$(ask 'Forward TCP and UDP ports (8080,443=8443 or 1000-1002=2000-2002)' 8080)"
+    mappings="$(expand_port_mappings "$ports")" || die 'Invalid port mappings'
+    if [[ $reverse == true && $'\n'$mappings == *$'\n'"$port="* ]]; then
+      die 'The reverse UDP carrier and a forwarded public port cannot share the same port'
+    fi
+  fi
+  local prompt='Paste the 64-character pairing key from the target server (input hidden)'
+  [[ $role != hub ]] || prompt='Pairing key (input hidden, Enter to generate)'
+  while true; do
+    if ! read -rs -p "$prompt: " secret; then
+      printf '\nPairing cancelled.\n' >&2
+      return 0
+    fi
+    echo
+    if [[ $role == hub && -z $secret ]]; then
+      secret="$(openssl rand -hex 32)"
+      [[ $secret =~ ^[[:xdigit:]]{64}$ ]] || die 'Unable to generate a pairing key'
+      printf 'Pairing key for the Iran server: %s\n' "$secret" >/dev/tty
+    fi
+    [[ $secret =~ ^[[:xdigit:]]{64}$ ]] && break
+    printf 'Enter exactly 64 hexadecimal characters (0-9, a-f).\n' >&2
+  done
   layout
   cfg="$PROFILE_DIR/$profile.toml"
   identity="$PKI_DIR/$profile-pair"
@@ -322,26 +459,28 @@ quick_setup()(
   [[ ! -e $cfg ]] || die 'Paired profile already exists'
   tmp="$(mktemp -d)"
   trap 'rm -rf "$tmp"' EXIT
-  pair_identity "$tmp" "$role" "$secret"
+  pair_identity "$tmp" "$tls_role" "$secret"
   unset secret
   {
-    printf 'profile = "%s"\nmode = "%s"\ntransport = "quic"\nlisten = "%s"\n' "$profile" "$role" "$listen"
-    if [[ $role == edge ]]; then printf 'peer = "%s:%s"\n' "$peer" "$port"; fi
+    printf 'profile = "%s"\nmode = "%s"\ntransport = "%s"\nlisten = "%s"\n' "$profile" "$role" "$transport" "$listen"
+    printf 'health_listen = "127.0.0.1:%s"\n' "$health_port"
+    if [[ $role == edge || $initiates == true ]]; then printf 'peer = "%s:%s"\n' "$peer" "$port"; fi
+    if [[ $reverse == true ]]; then printf 'reverse = true\n'; fi
+    if [[ -n $quic_mtu ]]; then printf 'quic_initial_mtu = %s\n' "$quic_mtu"; fi
     printf '[tls]\ncert_file = "%s/leaf.crt"\nkey_file = "%s/leaf.key"\nca_file = "%s/ca.crt"\n' "$identity" "$identity" "$identity"
-    if [[ $role == edge ]]; then echo 'server_name = "hub.local"'; fi
-    IFS=, read -ra mappings <<<"$ports"
-    for item in "${mappings[@]}"; do
-      public=${item%%=*}; target=${item##*=}
-      [[ $item == "$public" || $item == "$public=$target" ]] || die 'Invalid mapping'
-      for number in "$public" "$target"; do
-        [[ $number =~ ^[1-9][0-9]{0,4}$ && $number -le 65535 ]] || die 'Invalid port'
-      done
-      for proto in tcp udp; do
-        local bind=127.0.0.1:0
-        [[ $role == hub ]] || bind="0.0.0.0:$public"
-        printf '[[forwards]]\nname = "p%s-%s"\nprotocol = "%s"\nbind = "%s"\ntarget = "127.0.0.1:%s"\n' "$public" "$proto" "$proto" "$bind" "$target"
-      done
-    done
+    if [[ $initiates == true ]]; then echo 'server_name = "hub.local"'; fi
+    printf '\n[limits]\nmax_connections = %s\naccept_queue = %s\nidle_timeout_secs = %s\n' "$connections" "$queue" "$idle"
+    if [[ $kind == tun ]]; then
+      printf '\n[tun]\nname = "%s"\naddress = "%s"\nmtu = %s\n' "$tun_name" "$tun_address" "$tun_mtu"
+    else
+      while IFS='=' read -r public target; do
+        for proto in tcp udp; do
+          local bind=127.0.0.1:0
+          [[ $role == hub ]] || bind="0.0.0.0:$public"
+          printf '[[forwards]]\nname = "p%s-%s"\nprotocol = "%s"\nbind = "%s"\ntarget = "127.0.0.1:%s"\n' "$public" "$proto" "$proto" "$bind" "$target"
+        done
+      done <<<"$mappings"
+    fi
   } >"$tmp/profile.toml"
   mkdir -m 0750 "$identity" || die 'Pairing directory already exists'
   trap 'rm -rf "$tmp" "$identity"' EXIT
@@ -423,8 +562,51 @@ manage_profiles(){
   done
 }
 
+show_server(){
+  local route iface='Unavailable' address='Unavailable' gateway='Unavailable' i
+  local -a fields=()
+  route=$(ip -4 route get 1.1.1.1 2>/dev/null) || route=''
+  read -ra fields <<<"$route"
+  for ((i=0; i+1<${#fields[@]}; i++)); do
+    case ${fields[i]} in
+      dev) iface=${fields[i+1]} ;;
+      src) address=${fields[i+1]} ;;
+      via) gateway=${fields[i+1]} ;;
+    esac
+  done
+  printf '\nServer network\n'
+  printf '  Hostname    %s\n  Local IPv4  %s\n  Interface   %s\n  Gateway     %s\n' \
+    "$(uname -n)" "$address" "$iface" "$gateway"
+}
+
+create_menu(){
+  local kind role profile
+  show_server
+  printf '\nTunnel type\n  1  TUN (route IPv4 packets)\n  2  Service forwarding (TCP and UDP)\n  0  Back\n'
+  read -rp 'Select [0-2]: ' kind || return 0
+  case "$kind" in
+    1) kind=tun ;;
+    2) kind=services ;;
+    0) return 0 ;;
+    *) echo 'Choose 0, 1 or 2.'; return 0 ;;
+  esac
+  profile="$(ask 'Tunnel name (use the same name on both servers)' paired)"
+  if [[ ! $profile =~ ^[A-Za-z0-9_-]{1,64}$ ]]; then
+    echo 'Use up to 64 letters, digits, hyphens or underscores.'
+    return 0
+  fi
+  printf '\nServer role\n  1  Outside Iran (target)\n  2  Iran (listener)\n  0  Back\n'
+  read -rp 'Select [0-2]: ' role || return 0
+  case "$role" in
+    1) quick_setup hub "$kind" "$profile" ;;
+    2) quick_setup edge "$kind" "$profile" ;;
+    0) return 0 ;;
+    *) echo 'Choose 0, 1 or 2.' ;;
+  esac
+}
+
 menu(){
-  local choice role core count active title reset
+  local choice core count active title reset
   title=""; reset=""
   if [[ -t 1 && -z ${NO_COLOR:-} ]]; then title=$'\033[1;36m'; reset=$'\033[0m'; fi
   while true; do
@@ -440,9 +622,7 @@ menu(){
     printf '  1  Create tunnel\n  2  Manage tunnels\n  3  Advanced options\n  0  Exit\n'
     read -rp 'Select [0-3]: ' choice || return 0
     case "$choice" in
-      1) printf '\nWhich server is this?\n  1  Outside Iran (runs Xray or target service)\n  2  Iran (accepts user connections)\n  0  Back\n'
-         read -rp 'Select [0-2]: ' role || return 0
-         case "$role" in 1) quick_setup hub ;; 2) quick_setup edge ;; 0) continue ;; *) echo 'Choose 0, 1 or 2.' ;; esac ;;
+      1) create_menu ;;
       2) manage_profiles ;;
       3) advanced_menu ;;
       0) return 0 ;;
