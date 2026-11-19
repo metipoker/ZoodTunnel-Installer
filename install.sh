@@ -293,7 +293,7 @@ rollback(){
 # A random pairing key bootstraps the same trust anchor on both hosts.
 # Each endpoint generates its own leaf private key. TLS still authenticates both peers.
 pair_identity(){
-  local dir=$1 role=$2 secret=$3 usage=serverAuth
+  local dir=$1 role=$2 secret=$3 usage=serverAuth serial
   [[ $role == hub ]] || usage=clientAuth
   printf '%s' "$secret" | python3 -c '
 import hashlib, hmac, sys
@@ -307,7 +307,9 @@ sys.stdout.buffer.write(bytes.fromhex("302e020100300506032b657004220420") + seed
   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$dir/leaf.key"
   openssl req -new -key "$dir/leaf.key" -subj "/CN=$role.local" -out "$dir/leaf.csr"
   printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=%s\nsubjectAltName=DNS:%s.local\n' "$usage" "$role" >"$dir/extensions"
-  openssl x509 -req -in "$dir/leaf.csr" -CA "$dir/ca.crt" -CAkey "$dir/issuer.key" -days 825 -extfile "$dir/extensions" -out "$dir/leaf.crt"
+  serial="$(openssl rand -hex 16)"
+  openssl x509 -req -in "$dir/leaf.csr" -CA "$dir/ca.crt" -CAkey "$dir/issuer.key" \
+    -set_serial "0x01$serial" -days 825 -extfile "$dir/extensions" -out "$dir/leaf.crt"
   rm "$dir/issuer.der" "$dir/issuer.key" "$dir/leaf.csr" "$dir/extensions"
 }
 
