@@ -302,15 +302,24 @@ seed = hmac.new(key, b"ZoodTunnel pairing CA v1", hashlib.sha256).digest()
 sys.stdout.buffer.write(bytes.fromhex("302e020100300506032b657004220420") + seed)
 ' >"$dir/issuer.der"
   openssl pkey -inform DER -in "$dir/issuer.der" -out "$dir/issuer.key"
-  openssl req -new -x509 -key "$dir/issuer.key" -subj /CN=ZoodTunnel-Pair-v1 -days 3650 -set_serial 1 \
-    -addext 'basicConstraints=critical,CA:TRUE,pathlen:0' -addext 'keyUsage=critical,keyCertSign' -out "$dir/ca.crt"
+  cat >"$dir/issuer.cnf" <<'CNF'
+[req]
+distinguished_name = subject
+[subject]
+[issuer]
+basicConstraints = critical, CA:TRUE, pathlen:0
+keyUsage = critical, keyCertSign
+subjectKeyIdentifier = hash
+CNF
+  openssl req -new -x509 -config "$dir/issuer.cnf" -extensions issuer -key "$dir/issuer.key" \
+    -subj /CN=ZoodTunnel-Pair-v1 -days 3650 -set_serial 1 -out "$dir/ca.crt"
   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$dir/leaf.key"
   openssl req -new -key "$dir/leaf.key" -subj "/CN=$role.local" -out "$dir/leaf.csr"
   printf 'basicConstraints=critical,CA:FALSE\nkeyUsage=critical,digitalSignature\nextendedKeyUsage=%s\nsubjectAltName=DNS:%s.local\n' "$usage" "$role" >"$dir/extensions"
   serial="$(openssl rand -hex 16)"
   openssl x509 -req -in "$dir/leaf.csr" -CA "$dir/ca.crt" -CAkey "$dir/issuer.key" \
     -set_serial "0x01$serial" -days 825 -extfile "$dir/extensions" -out "$dir/leaf.crt"
-  rm "$dir/issuer.der" "$dir/issuer.key" "$dir/leaf.csr" "$dir/extensions"
+  rm "$dir/issuer.der" "$dir/issuer.key" "$dir/issuer.cnf" "$dir/leaf.csr" "$dir/extensions"
 }
 
 expand_port_mappings(){
